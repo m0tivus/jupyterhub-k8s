@@ -1,0 +1,28 @@
+apiVersion: skaffold/v2beta3
+kind: Config
+metadata:
+  name: jupyterhub-skaffold
+build:  # default config for minikube
+  local: {}
+  tagPolicy:
+    sha256: {} # automatically tags latest with sha256 hash
+  artifacts:
+  - image: aws_account_id.dkr.ecr.region.amazonaws.com/jupyterhub
+    context: ./jupyterhub/  #automatically tracks dockerfile to build image
+  - image: aws_account_id.dkr.ecr.region.amazonaws.com/base-notebook
+    context: ./notebook/base  #automatically tracks dockerfile to build image
+  - image: aws_account_id.dkr.ecr.region.amazonaws.com/pyspark-notebook
+    context: ./notebook/pyspark  #automatically tracks dockerfile to build image
+  - image: aws_account_id.dkr.ecr.region.amazonaws.com/scipy-notebook
+    context: ./notebook/scipy  #automatically tracks dockerfile to build image
+  - image: aws_account_id.dkr.ecr.region.amazonaws.com/datascience-notebook
+    context: ./notebook/datascience  #automatically tracks dockerfile to build image
+portForward:
+- resourceType: service
+  resourceName: jupyterhub-service
+  port: 8000
+  localPort: 9000
+deploy:
+  kubectl:
+    manifests:
+      - ./eks-deploy/jupyterhub-mainfest.yaml

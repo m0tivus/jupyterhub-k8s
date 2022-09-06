@@ -1,3 +1,41 @@
+apiVersion: v1
+kind: PersistentVolume # Create PV
+metadata:
+  namespace: default
+  name: pv-mysql # Sets PV name
+  labels:
+    type: local # Sets PV's type
+    app: mysql-deployment
+spec:
+  #storageClassName: "manual"
+  claimRef:
+    name: mysql-pv-claim
+    namespace: default
+  capacity:
+    storage: 3Gi # Sets PV's size
+  accessModes:
+    - ReadWriteMany
+  hostPath:
+    path: /data/mysql # Sets PV's host path
+
+---
+# persistent volume claim of mysql
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  namespace: default
+  name: mysql-pv-claim
+  labels:
+    app: mysql
+spec:
+  accessModes:
+    - ReadWriteOnce
+  #storageClassName: "manual"
+  resources:
+    requests:
+      storage: 3Gi
+
+---
 # Mysql deployment
 apiVersion: apps/v1
 kind: Deployment
@@ -19,8 +57,7 @@ spec:
         app: mysql
     spec:
       containers:
-        -
-          name: mysql
+        - name: mysql
           image: "mysql:5.6"
           imagePullPolicy: IfNotPresent
           ports:
@@ -38,7 +75,7 @@ spec:
 
 ---
 # Service of type ClusterIP for MYSQL in order for rubicon-jupyterhub to connect "internally"
-# by default it is cluster ip, but also being explicit
+# by jupyterhub it is cluster ip, but also being explicit
 apiVersion: v1
 kind: Service
 metadata:
@@ -50,23 +87,10 @@ spec:
   selector:
     app: mysql
   ports:
-  - protocol: TCP
-    port: 3306
-    targetPort: 3306
+    - protocol: TCP
+      port: 3306
+      targetPort: 3306
   type: ClusterIP
 
 ---
-# persistent volume claim of mysql
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: mysql-pv-claim
-  labels:
-    app: codehub
-spec:
-  accessModes:
-    - ReadWriteOnce
-  storageClassName: standard
-  resources:
-    requests:
-      storage: 1Gi
+

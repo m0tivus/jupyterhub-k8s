@@ -1,409 +1,501 @@
-# Configuration file for jupyterhub.
-import os
-import socket
-from kubespawner import KubeSpawner
-import dummyauthenticator
-import pymysql
-from oauthenticator.generic import GenericOAuthenticator, GenericLoginHandler
-from tornado import gen, web
-from tornado.httpclient import AsyncHTTPClient, HTTPRequest
-from tornado.httputil import url_concat
-from traitlets.config import get_config, json, sys
-from kubernetes.client.rest import ApiException
-from jupyterhub.utils import exponential_backoff
-import base64
-import urllib
-import json
-import time
-import urllib.request
-from jose import jwk, jwt
-from jose.utils import base64url_decode
-import os
+#  The single-user notebook server will never be scheduled by the kernel to use
+#  more cpu-cores than this. There is no guarantee that it can access this many
+#  cpu-cores.
+#  
+#  **This is a configuration setting. Your spawner must implement support for the
+#  limit to work.** The default spawner, `LocalProcessSpawner`, does **not**
+#  implement this support. A custom spawner **must** add support for this setting
+#  for it to be enforced.
+#  Default: None
+# c.Spawner.cpu_limit = None
 
-## AWS Cognito Configuration
-class Custom_Cognito_Authenticator(GenericOAuthenticator):
-    @staticmethod
-    def id_token_decoder(id_token):
-        token = id_token
-        region = os.environ['AWS_COGNITO_REGION']
-        userpool_id = os.environ['AWS_COGNITO_USERPOOL_ID']
-        app_client_id = os.environ['AWS_COGNITO_CLIENT_ID']
-        keys_url = 'https://cognito-idp.{}.amazonaws.com/{}/.well-known/jwks.json'.format(region, userpool_id)
-        # instead of re-downloading the public keys every time
-        # we download them only on cold start
-        # https://aws.amazon.com/blogs/compute/container-reuse-in-lambda/
-        with urllib.request.urlopen(keys_url) as f:
-            response = f.read()
-        keys = json.loads(response.decode('utf-8'))['keys']
-        # get the kid from the headers prior to verification
-        headers = jwt.get_unverified_headers(token)
-        kid = headers['kid']
-        # search for the kid in the downloaded public keys
-        key_index = -1
-        for i in range(len(keys)):
-            if kid == keys[i]['kid']:
-                key_index = i
-                break
-        if key_index == -1:
-            print('Public key not found in jwks.json')
-            return False
-        # construct the public key
-        public_key = jwk.construct(keys[key_index])
-        # get the last two sections of the token,
-        # message and signature (encoded in base64)
-        message, encoded_signature = str(token).rsplit('.', 1)
-        # decode the signature
-        decoded_signature = base64url_decode(encoded_signature.encode('utf-8'))
-        # verify the signature
-        if not public_key.verify(message.encode("utf8"), decoded_signature):
-            print('Signature verification failed')
-            return False
-        print('Signature successfully verified')
-        # since we passed the verification, we can now safely
-        # use the unverified claims
-        claims = jwt.get_unverified_claims(token)
-        # additionally we can verify the token expiration
-        if time.time() > claims['exp']:
-            print('Token is expired')
-            return False
-        # and the Audience  (use claims['client_id'] if verifying an access token)
-        if claims['aud'] != app_client_id:
-            print('Token was not issued for this audience')
-            return False
-        # now we can use the claims
-        print("****************************************************")
-        print(claims)
-        global list_of_roles
-        list_of_roles = []
-        if 'cognito:groups' in claims:
-            list_of_roles.append(claims['cognito:groups'])
-        return claims
+## Enable debug-logging of the single-user server
+#  Default: False
+# c.Spawner.debug = False
 
-    @gen.coroutine
-    def authenticate(self, handler, data=None):
-        code = handler.get_argument("code")
-        # TODO: Configure the curl_httpclient for tornado
-        http_client = AsyncHTTPClient()
+## The URL the single-user server should start in.
+#  
+#  `{username}` will be expanded to the user's username
+#  
+#  Example uses:
+#  
+#  - You can set `notebook_dir` to `/` and `default_url` to `/tree/home/{username}` to allow people to
+#    navigate the whole filesystem from their notebook server, but still start in their home directory.
+#  - Start with `/notebooks` instead of `/tree` if `default_url` points to a notebook instead of a directory.
+#  - You can set this to `/lab` to have JupyterLab start by default, rather than Jupyter Notebook.
+#  Default: ''
+# c.Spawner.default_url = ''
 
-        params = dict(
-            redirect_uri=self.get_callback_url(handler),
-            code=code,
-            grant_type='authorization_code'
-        )
-        params.update(self.extra_params)
+## Disable per-user configuration of single-user servers.
+#  
+#  When starting the user's single-user server, any config file found in the
+#  user's $HOME directory will be ignored.
+#  
+#  Note: a user could circumvent this if the user modifies their Python
+#  environment, such as when they have their own conda environments / virtualenvs
+#  / containers.
+#  Default: False
+# c.Spawner.disable_user_config = False
 
-        if self.token_url:
-            url = self.token_url
-        else:
-            raise ValueError("Please set the OAUTH2_TOKEN_URL environment variable")
+## List of environment variables for the single-user server to inherit from the
+#  JupyterHub process.
+#  
+#  This list is used to ensure that sensitive information in the JupyterHub
+#  process's environment (such as `CONFIGPROXY_AUTH_TOKEN`) is not passed to the
+#  single-user server's process.
+#  Default: ['PATH', 'PYTHONPATH', 'CONDA_ROOT', 'CONDA_DEFAULT_ENV', 'VIRTUAL_ENV', 'LANG', 'LC_ALL', 'JUPYTERHUB_SINGLEUSER_APP']
+# c.Spawner.env_keep = ['PATH', 'PYTHONPATH', 'CONDA_ROOT', 'CONDA_DEFAULT_ENV', 'VIRTUAL_ENV', 'LANG', 'LC_ALL', 'JUPYTERHUB_SINGLEUSER_APP']
 
-        b64key = base64.b64encode(
-            bytes(
-                "{}:{}".format(self.client_id, self.client_secret),
-                "utf8"
-            )
-        )
+## Extra environment variables to set for the single-user server's process.
+#  
+#  Environment variables that end up in the single-user server's process come from 3 sources:
+#    - This `environment` configurable
+#    - The JupyterHub process' environment variables that are listed in `env_keep`
+#    - Variables to establish contact between the single-user notebook and the hub (such as JUPYTERHUB_API_TOKEN)
+#  
+#  The `environment` configurable should be set by JupyterHub administrators to
+#  add installation specific environment variables. It is a dict where the key is
+#  the name of the environment variable, and the value can be a string or a
+#  callable. If it is a callable, it will be called with one parameter (the
+#  spawner instance), and should return a string fairly quickly (no blocking
+#  operations please!).
+#  
+#  Note that the spawner class' interface is not guaranteed to be exactly same
+#  across upgrades, so if you are using the callable take care to verify it
+#  continues to work after upgrades!
+#  
+#  .. versionchanged:: 1.2
+#      environment from this configuration has highest priority,
+#      allowing override of 'default' env variables,
+#      such as JUPYTERHUB_API_URL.
+#  Default: {}
+# c.Spawner.environment = {}
 
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": "JupyterHub",
-            "Authorization": "Basic {}".format(b64key.decode("utf8"))
-        }
-        req = HTTPRequest(url,
-                          method="POST",
-                          headers=headers,
-                          validate_cert=self.tls_verify,
-                          body=urllib.parse.urlencode(params)  # Body is required for a POST...
-                          )
+## Timeout (in seconds) before giving up on a spawned HTTP server
+#  
+#  Once a server has successfully been spawned, this is the amount of time we
+#  wait before assuming that the server is unable to accept connections.
+#  Default: 30
+# c.Spawner.http_timeout = 30
 
-        resp = yield http_client.fetch(req)
-        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
-        self.log.info("######################################")
-        self.log.info(resp_json)
+## The URL the single-user server should connect to the Hub.
+#  
+#  If the Hub URL set in your JupyterHub config is not reachable from spawned
+#  notebooks, you can set differnt URL by this config.
+#  
+#  Is None if you don't need to change the URL.
+#  Default: None
+# c.Spawner.hub_connect_url = None
 
-        access_token = resp_json['access_token']
-        refresh_token = resp_json.get('refresh_token', None)
-        token_type = resp_json['token_type']
-        id_token = resp_json['id_token']
-        ########
-        self.id_token_decoder(id_token)                                                                                                                  
-        ########
-        scope = resp_json.get('scope', '')
-        if (isinstance(scope, str)):
-                scope = scope.split(' ')        
+## The IP address (or hostname) the single-user server should listen on.
+#  
+#  Usually either '127.0.0.1' (default) or '0.0.0.0'.
+#  
+#  The JupyterHub proxy implementation should be able to send packets to this
+#  interface.
+#  
+#  Subclasses which launch remotely or in containers should override the default
+#  to '0.0.0.0'.
+#  
+#  .. versionchanged:: 2.0
+#      Default changed to '127.0.0.1', from ''.
+#      In most cases, this does not result in a change in behavior,
+#      as '' was interpreted as 'unspecified',
+#      which used the subprocesses' own default, itself usually '127.0.0.1'.
+#  Default: '127.0.0.1'
+# c.Spawner.ip = '127.0.0.1'
 
-        # Determine who the logged in user is
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": "JupyterHub",
-            "Authorization": "{} {}".format(token_type, access_token)
-        }
-        if self.userdata_url:
-            url = url_concat(self.userdata_url, self.userdata_params)
-            self.log.info("%%%%%%%%%%%%%%%%%%%%%%%%")
-            self.log.info(url)
-        else:
-            raise ValueError("Please set the OAUTH2_USERDATA_URL environment variable")
+## Minimum number of bytes a single-user notebook server is guaranteed to have
+#  available.
+#  
+#  Allows the following suffixes:
+#    - K -> Kilobytes
+#    - M -> Megabytes
+#    - G -> Gigabytes
+#    - T -> Terabytes
+#  
+#  **This is a configuration setting. Your spawner must implement support for the
+#  limit to work.** The default spawner, `LocalProcessSpawner`, does **not**
+#  implement this support. A custom spawner **must** add support for this setting
+#  for it to be enforced.
+#  Default: None
+# c.Spawner.mem_guarantee = None
 
-        req = HTTPRequest(url,
-                          method=self.userdata_method,
-                          headers=headers,
-                          validate_cert=self.tls_verify,
-                          )
-        resp = yield http_client.fetch(req)
-        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
-        self.log.info(resp_json)
+## Maximum number of bytes a single-user notebook server is allowed to use.
+#  
+#  Allows the following suffixes:
+#    - K -> Kilobytes
+#    - M -> Megabytes
+#    - G -> Gigabytes
+#    - T -> Terabytes
+#  
+#  If the single user server tries to allocate more memory than this, it will
+#  fail. There is no guarantee that the single-user notebook server will be able
+#  to allocate this much memory - only that it can not allocate more than this.
+#  
+#  **This is a configuration setting. Your spawner must implement support for the
+#  limit to work.** The default spawner, `LocalProcessSpawner`, does **not**
+#  implement this support. A custom spawner **must** add support for this setting
+#  for it to be enforced.
+#  Default: None
+# c.Spawner.mem_limit = None
 
-        if not resp_json.get(self.username_key):
-            self.log.error("OAuth user contains no key %s: %s", self.username_key, resp_json)
-            return
-        self.log.info(resp_json)
-       
-        return {
-            'name': resp_json.get(self.username_key),
-            'auth_state': {
-                'access_token': access_token,
-                'refresh_token': refresh_token,
-                'oauth_user': resp_json,
-                'scope': scope,
-            }
-        }
-    
-c.JupyterHub.authenticator_class = Custom_Cognito_Authenticator
-c.OAuthenticator.client_id = os.environ['AWS_COGNITO_CLIENT_ID']
-c.OAuthenticator.client_secret = os.environ['AWS_COGNITO_CLIENT_SECRET'] 
-c.OAuthenticator.login_service = os.environ['AWS_COGNITO_LOGIN_SERVICE'] 
-c.OAuthenticator.oauth_callback_url = os.environ['AWS_COGNITO_OAUTH_CALLBACK_URL']
+## Path to the notebook directory for the single-user server.
+#  
+#  The user sees a file listing of this directory when the notebook interface is
+#  started. The current interface does not easily allow browsing beyond the
+#  subdirectories in this directory's tree.
+#  
+#  `~` will be expanded to the home directory of the user, and {username} will be
+#  replaced with the name of the user.
+#  
+#  Note that this does *not* prevent users from accessing files outside of this
+#  path! They can do so with many other means.
+#  Default: ''
+# c.Spawner.notebook_dir = ''
 
-c.Authenticator.allowed_users = {'iammanshi116@gmail.com', 'abcd@gmail.com'}
-c.Authenticator.admin_users = {'iammanshi116@gmail.com'}
+## Allowed roles for oauth tokens.
+#  
+#          This sets the maximum and default roles
+#          assigned to oauth tokens issued by a single-user server's
+#          oauth client (i.e. tokens stored in browsers after authenticating with the server),
+#          defining what actions the server can take on behalf of logged-in users.
+#  
+#          Default is an empty list, meaning minimal permissions to identify users,
+#          no actions can be taken on their behalf.
+#  Default: traitlets.Undefined
+# c.Spawner.oauth_roles = traitlets.Undefined
 
-## Custom Kubespawner
-class Custon_KubeSpawner(KubeSpawner):
-    @gen.coroutine
-    def _start(self):
-        """Start the user's pod"""
+## An HTML form for options a user can specify on launching their server.
+#  
+#  The surrounding `<form>` element and the submit button are already provided.
+#  
+#  For example:
+#  
+#  .. code:: html
+#  
+#      Set your key:
+#      <input name="key" val="default_key"></input>
+#      <br>
+#      Choose a letter:
+#      <select name="letter" multiple="true">
+#        <option value="A">The letter A</option>
+#        <option value="B">The letter B</option>
+#      </select>
+#  
+#  The data from this form submission will be passed on to your spawner in
+#  `self.user_options`
+#  
+#  Instead of a form snippet string, this could also be a callable that takes as
+#  one parameter the current spawner instance and returns a string. The callable
+#  will be called asynchronously if it returns a future, rather than a str. Note
+#  that the interface of the spawner class is not deemed stable across versions,
+#  so using this functionality might cause your JupyterHub upgrades to break.
+#  Default: traitlets.Undefined
+# c.Spawner.options_form = traitlets.Undefined
 
-        # load user options (including profile)
-        yield self.load_user_options()
+## Interpret HTTP form data
+#  
+#  Form data will always arrive as a dict of lists of strings. Override this
+#  function to understand single-values, numbers, etc.
+#  
+#  This should coerce form data into the structure expected by self.user_options,
+#  which must be a dict, and should be JSON-serializeable, though it can contain
+#  bytes in addition to standard JSON data types.
+#  
+#  This method should not have any side effects. Any handling of `user_options`
+#  should be done in `.start()` to ensure consistent behavior across servers
+#  spawned via the API and form submission page.
+#  
+#  Instances will receive this data on self.user_options, after passing through
+#  this function, prior to `Spawner.start`.
+#  
+#  .. versionchanged:: 1.0
+#      user_options are persisted in the JupyterHub database to be reused
+#      on subsequent spawns if no options are given.
+#      user_options is serialized to JSON as part of this persistence
+#      (with additional support for bytes in case of uploaded file data),
+#      and any non-bytes non-jsonable values will be replaced with None
+#      if the user_options are re-used.
+#  Default: traitlets.Undefined
+# c.Spawner.options_from_form = traitlets.Undefined
 
-        ## load roles
-        self.log.info("******************************")
-        self.log.info(list_of_roles)
-        roles = []
-        if len(list_of_roles)> 0 :
-            roles = list_of_roles[0]
-        else:
-            roles = ['RECENTLY_SIGNED']
-        self.log.info(roles)
-        # custom volume mount path 
-        admin_volume_path = [{'mountPath': '/home/myuser/work/',
-                'name': 'persistent-storage',
-                'subPath': 'home-folder'}]
-        student_engine_volume_path = [{'mountPath': '/home/myuser/work/',
-                'name': 'persistent-storage',
-                'subPath': 'home-folder/pyspark-engine'}]
-        recommendation_engine_volume_path = [{'mountPath': '/home/myuser/work/',
-                'name': 'persistent-storage',
-                'subPath': 'home-folder/scipy-engine'}]
-        analytics_engine_volume_path = [{'mountPath': '/home/myuser/work/',
-                'name': 'persistent-storage',
-                'subPath': 'home-folder/datascience-engine'}]
+## Interval (in seconds) on which to poll the spawner for single-user server's
+#  status.
+#  
+#  At every poll interval, each spawner's `.poll` method is called, which checks
+#  if the single-user server is still running. If it isn't running, then
+#  JupyterHub modifies its own state accordingly and removes appropriate routes
+#  from the configurable proxy.
+#  Default: 30
+# c.Spawner.poll_interval = 30
 
-        if ("ADMIN" in roles):
-            self.image = 'aws_account_id.dkr.ecr.region.amazonaws.com/datascience-notebook:latest'
-            self.volume_mounts = admin_volume_path
-        elif ("PYSPARK_RUNTIME_USER" in roles):
-            self.image = 'aws_account_id.dkr.ecr.region.amazonaws.com/pyspark-notebook:latest'
-            self.volume_mounts = student_engine_volume_path
-        elif ("SCIPY_RUNTIME_USER" in roles):
-            self.image = 'aws_account_id.dkr.ecr.region.amazonaws.com/scipy-notebook:latest'
-            self.volume_mounts = student_engine_volume_path
-        elif ("DATASCIENCE_RUNTIME_USER" in roles):
-            self.image = 'aws_account_id.dkr.ecr.region.amazonaws.com/scipy-notebook:latest'
-            self.volume_mounts = student_engine_volume_path
-        else:
-            # spawn a normal notebook only
-            self.image = 'jupyter/base-notebook:latest'
+## The port for single-user servers to listen on.
+#  
+#  Defaults to `0`, which uses a randomly allocated port number each time.
+#  
+#  If set to a non-zero value, all Spawners will use the same port, which only
+#  makes sense if each server is on a different address, e.g. in containers.
+#  
+#  New in version 0.7.
+#  Default: 0
+# c.Spawner.port = 0
 
-        # record latest event so we don't include old
-        # events from previous pods in self.events
-        # track by order and name instead of uid
-        # so we get events like deletion of a previously stale
-        # pod if it's part of this spawn process
-        events = self.events
-        if events:
-            self._last_event = events[-1].metadata.uid
+## An optional hook function that you can implement to do work after the spawner
+#  stops.
+#  
+#  This can be set independent of any concrete spawner implementation.
+#  Default: None
+# c.Spawner.post_stop_hook = None
 
-        if self.storage_pvc_ensure:
-            # Try and create the pvc. If it succeeds we are good. If
-            # returns a 409 indicating it already exists we are good. If
-            # it returns a 403, indicating potential quota issue we need
-            # to see if pvc already exists before we decide to raise the
-            # error for quota being exceeded. This is because quota is
-            # checked before determining if the PVC needed to be
-            # created.
+## An optional hook function that you can implement to do some bootstrapping work
+#  before the spawner starts. For example, create a directory for your user or
+#  load initial content.
+#  
+#  This can be set independent of any concrete spawner implementation.
+#  
+#  This maybe a coroutine.
+#  
+#  Example::
+#  
+#      from subprocess import check_call
+#      def my_hook(spawner):
+#          username = spawner.user.name
+#          check_call(['./examples/bootstrap-script/bootstrap.sh', username])
+#  
+#      c.Spawner.pre_spawn_hook = my_hook
+#  Default: None
+# c.Spawner.pre_spawn_hook = None
 
-            pvc = self.get_pvc_manifest()
+## List of SSL alt names
+#  
+#          May be set in config if all spawners should have the same value(s),
+#          or set at runtime by Spawner that know their names.
+#  Default: []
+# c.Spawner.ssl_alt_names = []
 
-            try:
-                yield self.asynchronize(
-                    self.api.create_namespaced_persistent_volume_claim,
-                    namespace=self.namespace,
-                    body=pvc
-                )
-            except ApiException as e:
-                if e.status == 409:
-                    self.log.info("PVC " + self.pvc_name + " already exists, so did not create new pvc.")
+## Whether to include DNS:localhost, IP:127.0.0.1 in alt names
+#  Default: True
+# c.Spawner.ssl_alt_names_include_local = True
 
-                elif e.status == 403:
-                    t, v, tb = sys.exc_info()
+## Timeout (in seconds) before giving up on starting of single-user server.
+#  
+#  This is the timeout for start to return, not the timeout for the server to
+#  respond. Callers of spawner.start will assume that startup has failed if it
+#  takes longer than this. start should return when the server process is started
+#  and its location is known.
+#  Default: 60
+# c.Spawner.start_timeout = 60
 
-                    try:
-                        yield self.asynchronize(
-                            self.api.read_namespaced_persistent_volume_claim,
-                            name=self.pvc_name,
-                            namespace=self.namespace)
+#------------------------------------------------------------------------------
+# Authenticator(LoggingConfigurable) configuration
+#------------------------------------------------------------------------------
+## Base class for implementing an authentication provider for JupyterHub
 
-                    except ApiException as e:
-                        raise v.with_traceback(tb)
+## Set of users that will have admin rights on this JupyterHub.
+#  
+#  Note: As of JupyterHub 2.0, full admin rights should not be required, and more
+#  precise permissions can be managed via roles.
+#  
+#  Admin users have extra privileges:
+#   - Use the admin panel to see list of users logged in
+#   - Add / remove users in some authenticators
+#   - Restart / halt the hub
+#   - Start / stop users' single-user servers
+#   - Can access each individual users' single-user server (if configured)
+#  
+#  Admin access should be treated the same way root access is.
+#  
+#  Defaults to an empty set, in which case no user has admin access.
+#  Default: set()
+# c.Authenticator.admin_users = set()
 
-                    self.log.info("PVC " + self.pvc_name + " already exists, possibly have reached quota though.")
+## Set of usernames that are allowed to log in.
+#  
+#  Use this with supported authenticators to restrict which users can log in.
+#  This is an additional list that further restricts users, beyond whatever
+#  restrictions the authenticator has in place. Any user in this list is granted
+#  the 'user' role on hub startup.
+#  
+#  If empty, does not perform any additional restriction.
+#  
+#  .. versionchanged:: 1.2
+#      `Authenticator.whitelist` renamed to `allowed_users`
+#  Default: set()
+# c.Authenticator.allowed_users = set()
 
-                else:
-                    raise
+## The max age (in seconds) of authentication info
+#          before forcing a refresh of user auth info.
+#  
+#          Refreshing auth info allows, e.g. requesting/re-validating auth
+#  tokens.
+#  
+#          See :meth:`.refresh_user` for what happens when user auth info is refreshed
+#          (nothing by default).
+#  Default: 300
+# c.Authenticator.auth_refresh_age = 300
 
-        # If we run into a 409 Conflict error, it means a pod with the
-        # same name already exists. We stop it, wait for it to stop, and
-        # try again. We try 4 times, and if it still fails we give up.
-        # FIXME: Have better / cleaner retry logic!
-        retry_times = 4
-        pod = yield self.get_pod_manifest()
-        if self.modify_pod_hook:
-            pod = yield gen.maybe_future(self.modify_pod_hook(self, pod))
-        for i in range(retry_times):
-            try:
-                yield self.asynchronize(
-                    self.api.create_namespaced_pod,
-                    self.namespace,
-                    pod,
-                )
-                break
-            except ApiException as e:
-                if e.status != 409:
-                    # We only want to handle 409 conflict errors
-                    self.log.exception("Failed for %s", pod.to_str())
-                    raise
-                self.log.info('Found existing pod %s, attempting to kill', self.pod_name)
-                # TODO: this should show up in events
-                yield self.stop(True)
+## Automatically begin the login process
+#  
+#          rather than starting with a "Login with..." link at `/hub/login`
+#  
+#          To work, `.login_url()` must give a URL other than the default `/hub/login`,
+#          such as an oauth handler or another automatic login handler,
+#          registered with `.get_handlers()`.
+#  
+#          .. versionadded:: 0.8
+#  Default: False
+# c.Authenticator.auto_login = False
 
-                self.log.info('Killed pod %s, will try starting singleuser pod again', self.pod_name)
-        else:
-            raise Exception(
-                'Can not create user pod %s already exists & could not be deleted' % self.pod_name)
+## Automatically begin login process for OAuth2 authorization requests
+#  
+#  When another application is using JupyterHub as OAuth2 provider, it sends
+#  users to `/hub/api/oauth2/authorize`. If the user isn't logged in already, and
+#  auto_login is not set, the user will be dumped on the hub's home page, without
+#  any context on what to do next.
+#  
+#  Setting this to true will automatically redirect users to login if they aren't
+#  logged in *only* on the `/hub/api/oauth2/authorize` endpoint.
+#  
+#  .. versionadded:: 1.5
+#  Default: False
+# c.Authenticator.auto_login_oauth2_authorize = False
 
-        # we need a timeout here even though start itself has a timeout
-        # in order for this coroutine to finish at some point.
-        # using the same start_timeout here
-        # essentially ensures that this timeout should never propagate up
-        # because the handler will have stopped waiting after
-        # start_timeout, starting from a slightly earlier point.
-        try:
-            yield exponential_backoff(
-                lambda: self.is_pod_running(self.pod_reflector.pods.get(self.pod_name, None)),
-                'pod/%s did not start in %s seconds!' % (self.pod_name, self.start_timeout),
-                timeout=self.start_timeout,
-            )
-        except TimeoutError:
-            if self.pod_name not in self.pod_reflector.pods:
-                # if pod never showed up at all,
-                # restart the pod reflector which may have become disconnected.
-                self.log.error(
-                    "Pod %s never showed up in reflector, restarting pod reflector",
-                    self.pod_name,
-                )
-                self._start_watching_pods(replace=True)
-            raise
+## Set of usernames that are not allowed to log in.
+#  
+#  Use this with supported authenticators to restrict which users can not log in.
+#  This is an additional block list that further restricts users, beyond whatever
+#  restrictions the authenticator has in place.
+#  
+#  If empty, does not perform any additional restriction.
+#  
+#  .. versionadded: 0.9
+#  
+#  .. versionchanged:: 1.2
+#      `Authenticator.blacklist` renamed to `blocked_users`
+#  Default: set()
+# c.Authenticator.blocked_users = set()
 
-        pod = self.pod_reflector.pods[self.pod_name]
-        self.pod_id = pod.metadata.uid
-        if self.event_reflector:
-            self.log.debug(
-                'pod %s events before launch: %s',
-                self.pod_name,
-                "\n".join(
-                    [
-                        "%s [%s] %s" % (event.last_timestamp or event.event_time, event.type, event.message)
-                        for event in self.events
-                    ]
-                ),
-            )
-        return (pod.status.pod_ip, self.port)
+## Delete any users from the database that do not pass validation
+#  
+#          When JupyterHub starts, `.add_user` will be called
+#          on each user in the database to verify that all users are still valid.
+#  
+#          If `delete_invalid_users` is True,
+#          any users that do not pass validation will be deleted from the database.
+#          Use this if users might be deleted from an external system,
+#          such as local user accounts.
+#  
+#          If False (default), invalid users remain in the Hub's database
+#          and a warning will be issued.
+#          This is the default to avoid data loss due to config changes.
+#  Default: False
+# c.Authenticator.delete_invalid_users = False
 
-c.JupyterHub.spawner_class = Custon_KubeSpawner
+## Enable persisting auth_state (if available).
+#  
+#          auth_state will be encrypted and stored in the Hub's database.
+#          This can include things like authentication tokens, etc.
+#          to be passed to Spawners as environment variables.
+#  
+#          Encrypting auth_state requires the cryptography package.
+#  
+#          Additionally, the JUPYTERHUB_CRYPT_KEY environment variable must
+#          contain one (or more, separated by ;) 32B encryption keys.
+#          These can be either base64 or hex-encoded.
+#  
+#          If encryption is unavailable, auth_state cannot be persisted.
+#  
+#          New in JupyterHub 0.8
+#  Default: False
+# c.Authenticator.enable_auth_state = False
 
-c.JupyterHub.ip = '0.0.0.0'
-c.JupyterHub.hub_ip = '0.0.0.0'
-c.Spawner.http_timeout = 60 * 5
-c.KubeSpawner.start_timeout = 60 * 5
-c.JupyterHub.cleanup_servers = False
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.connect(("8.8.8.8", 80))
-host_ip = s.getsockname()[0]
-s.close()
-c.KubeSpawner.hub_connect_ip = host_ip
-c.JupyterHub.redirect_to_server = True
-c.JupyterHub.allow_named_servers = True
-c.JupyterHub.cleanup_servers = True
-c.JupyterHub.shutdown_on_logout = True
+## Let authenticator manage user groups
+#  
+#          If True, Authenticator.authenticate and/or .refresh_user
+#          may return a list of group names in the 'groups' field,
+#          which will be assigned to the user.
+#  
+#          All group-assignment APIs are disabled if this is True.
+#  Default: False
+# c.Authenticator.manage_groups = False
 
-c.KubeSpawner.service_account = 'default'
-c.KubeSpawner.image_pull_policy = 'IfNotPresent'
+## An optional hook function that you can implement to do some bootstrapping work
+#  during authentication. For example, loading user account details from an
+#  external system.
+#  
+#  This function is called after the user has passed all authentication checks
+#  and is ready to successfully authenticate. This function must return the
+#  authentication dict reguardless of changes to it.
+#  
+#  This maybe a coroutine.
+#  
+#  .. versionadded: 1.0
+#  
+#  Example::
+#  
+#      import os, pwd
+#      def my_hook(authenticator, handler, authentication):
+#          user_data = pwd.getpwnam(authentication['name'])
+#          spawn_data = {
+#              'pw_data': user_data
+#              'gid_list': os.getgrouplist(authentication['name'], user_data.pw_gid)
+#          }
+#  
+#          if authentication['auth_state'] is None:
+#              authentication['auth_state'] = {}
+#          authentication['auth_state']['spawn_data'] = spawn_data
+#  
+#          return authentication
+#  
+#      c.Authenticator.post_auth_hook = my_hook
+#  Default: None
+# c.Authenticator.post_auth_hook = None
 
-## database
-c.JupyterHub.db_url = os.environ['DB_URL']
+## Force refresh of auth prior to spawn.
+#  
+#          This forces :meth:`.refresh_user` to be called prior to launching
+#          a server, to ensure that auth state is up-to-date.
+#  
+#          This can be important when e.g. auth tokens that may have expired
+#          are passed to the spawner via environment variables from auth_state.
+#  
+#          If refresh_user cannot refresh the user auth data,
+#          launch will fail until the user logs in again.
+#  Default: False
+# c.Authenticator.refresh_pre_spawn = False
 
-## switch from notebook to lab
-#c.KubeSpawner.default_url ='/user/{username}/lab?'
-#c.Spawner.default_url = '/lab'
+## Dictionary mapping authenticator usernames to JupyterHub users.
+#  
+#          Primarily used to normalize OAuth user names to local users.
+#  Default: {}
+# c.Authenticator.username_map = {}
 
-# resources configuration
-c.KubeSpawner.cpu_limit = 1
-c.KubeSpawner.cpu_guarantee = 0.1
-c.KubeSpawner.mem_limit = '1G'
-c.KubeSpawner.mem_guarantee = '100M'
+## Regular expression pattern that all valid usernames must match.
+#  
+#  If a username does not match the pattern specified here, authentication will
+#  not be attempted.
+#  
+#  If not set, allow any username.
+#  Default: ''
+# c.Authenticator.username_pattern = ''
 
-if os.environ['ENVIRONMENT']=='local':
-    ## volumes and volume mounts in NFS (Local)
-    c.KubeSpawner.volumes = [
-        {
-            'name': 'persistent-storage',
-            'persistentVolumeClaim': {
-                'claimName': 'nfs-pvc-claim'
-            }
-        }
-    ]
-else:
-    ## volumes and volume mounts in EFS (AWS)
-    c.KubeSpawner.volumes = [
-        {
-            'name': 'persistent-storage',
-            'persistentVolumeClaim': {
-                'claimName': 'efs-claim'
-            }
-        }
-    ]
+## Deprecated, use `Authenticator.allowed_users`
+#  Default: set()
+# c.Authenticator.whitelist = set()
 
-## cull_idle
-c.JupyterHub.services = [
-    {
-        'name': 'cull-idle',
-        'admin': True,
-        'command': 'python3 cull_idle.py --timeout=600'.split(),
-    }
-]
+#------------------------------------------------------------------------------
+# CryptKeeper(SingletonConfigurable) configuration
+#------------------------------------------------------------------------------
+## Encapsulate encryption configuration
+#  
+#      Use via the encryption_config singleton below.
 
+#  Default: []
+# c.CryptKeeper.keys = []
 
+## The number of threads to allocate for encryption
+#  Default: 16
+# c.CryptKeeper.n_threads = 16
 
 

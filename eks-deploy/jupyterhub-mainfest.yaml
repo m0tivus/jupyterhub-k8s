@@ -5,7 +5,7 @@ metadata:
   namespace: default
   name: jupyterhub-deployment
   labels:
-      app: jupyterhub  # this label is used by the serivce
+    app: jupyterhub # this label is used by the serivce
 # sepcification contains the selectors
 spec:
   replicas: 1
@@ -15,26 +15,26 @@ spec:
       app: jupyterhub
   # template = blueprint for the pods
   template:
-      # specification of codehub pod with its own metadata and spec
+    # specification of codehub pod with its own metadata and spec
     metadata:
       labels:
-        app: jupyterhub  # this label is used by the service
+        app: jupyterhub # this label is used by the service
     spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: jupyterhub-image
-          image: aws_account_id.dkr.ecr.region.amazonaws.com/jupyterhub # automatically attaches image with latest tag
+          image: jupyterhub/k8s-hub:1.1.3-n795.hc8ae476b # automatically attaches image with latest tag
           imagePullPolicy: Always
           envFrom:
             - configMapRef:
                 name: application-config
           resources:
-           limits:
-             memory: "1000Mi"
-             cpu: "1000m"
-           requests:
-             memory: "100Mi"
-             cpu: "200m"
+            limits:
+              memory: "1000Mi"
+              cpu: "1000m"
+            requests:
+              memory: "100Mi"
+              cpu: "200m"
 
 ---
 apiVersion: v1
@@ -44,9 +44,9 @@ metadata:
   namespace: default
 spec:
   selector:
-    app: jupyterhub  # deployment and pod labels
+    app: jupyterhub # deployment and pod labels
   ports:
-  - port: 8000
-    protocol: TCP
-    targetPort: 8000 # port in which the container codehub is running on
+    - port: 8000
+      protocol: TCP
+      targetPort: 8000 # port in which the container codehub is running on
   type: LoadBalancer

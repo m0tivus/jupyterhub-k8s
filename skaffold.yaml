@@ -1,28 +1,13 @@
-apiVersion: skaffold/v2beta3
+apiVersion: skaffold/v2beta27
 kind: Config
 metadata:
-  name: jupyterhub-skaffold
-build:  # default config for minikube
-  local: {}
-  tagPolicy:
-    sha256: {} # automatically tags latest with sha256 hash
-  artifacts:
-  - image: aws_account_id.dkr.ecr.region.amazonaws.com/jupyterhub
-    context: ./jupyterhub/  #automatically tracks dockerfile to build image
-  - image: aws_account_id.dkr.ecr.region.amazonaws.com/base-notebook
-    context: ./notebook/base  #automatically tracks dockerfile to build image
-  - image: aws_account_id.dkr.ecr.region.amazonaws.com/pyspark-notebook
-    context: ./notebook/pyspark  #automatically tracks dockerfile to build image
-  - image: aws_account_id.dkr.ecr.region.amazonaws.com/scipy-notebook
-    context: ./notebook/scipy  #automatically tracks dockerfile to build image
-  - image: aws_account_id.dkr.ecr.region.amazonaws.com/datascience-notebook
-    context: ./notebook/datascience  #automatically tracks dockerfile to build image
-portForward:
-- resourceType: service
-  resourceName: jupyterhub-service
-  port: 8000
-  localPort: 9000
-deploy:
-  kubectl:
-    manifests:
-      - ./eks-deploy/jupyterhub-mainfest.yaml
+  name: kubernetes-prometheus
+profiles:
+  - name: local
+    deploy:
+      kubectl:
+        manifests:
+          - minikube-deploy/env-local.yaml
+          - minikube-deploy/nfs-mainfest.yaml
+          - minikube-deploy/mysql-mainfest.yaml
+          - eks-deploy/jupyterhub-mainfest.yaml
