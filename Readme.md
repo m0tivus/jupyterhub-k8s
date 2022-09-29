@@ -1,3 +1,5 @@
+# DEPRECATED
+
 # Jupyterhub in AWS EKS
 ## Minikube SetUp(Local)
 ### Prerequsites SetUp
